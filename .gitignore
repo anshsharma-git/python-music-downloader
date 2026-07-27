@@ -1,0 +1,15 @@
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local application outputs & logs
+download_archive.txt
+*.mp3
+*.flac
+*.m4a
+*.webm
