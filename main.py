@@ -1,365 +1,755 @@
-import os
-import sys
-import shutil
-import threading
+#!/usr/bin/env python3
+"""SonicGrabber Pro v5.1 – Unified search, y2mate-inspired, all bugs fixed."""
+
+import os, re, sys, json, copy, shutil, subprocess, threading
 import concurrent.futures
+from dataclasses import dataclass
 from pathlib import Path
+from datetime import datetime
+from typing import List
+
 import customtkinter as ctk
+from tkinter import filedialog, messagebox
 import yt_dlp
-from spotdl import Spotdl
 
-# --- LYRICS & METADATA IMPORTS ---
-import syncedlyrics
-from mutagen.id3 import ID3, USLT, ID3NoHeaderError
+try:
+    import syncedlyrics; LYRICS_OK = True
+except Exception: LYRICS_OK = False
+try:
+    from mutagen.id3 import ID3, USLT, ID3NoHeaderError
+    from mutagen.flac import FLAC
+    from mutagen.mp4 import MP4
+    MUTAGEN_OK = True
+except Exception: MUTAGEN_OK = False
 
-# --- VIRTUAL ENVIRONMENT CHECK ---
-print("=" * 50)
-print(f"🐍 Python Executable: {sys.executable}")
-print(f"📦 Inside Virtual Env?: {sys.prefix != sys.base_prefix}")
-print("=" * 50)
+APP = "SonicGrabber Pro"
+VER = "5.1.0"
+CFG = Path.home() / ".sonicgrabber_v5.json"
 
-# Set CustomTkinter Visual Theme
-ctk.set_appearance_mode("Dark")
-ctk.set_default_color_theme("blue")
+FORMATS = {
+    "MP3 · 320 kbps":  {"codec": "mp3",  "q": "320", "ext": "mp3"},
+    "FLAC · Lossless": {"codec": "flac", "q": "0",   "ext": "flac"},
+    "M4A · AAC 256":   {"codec": "m4a",  "q": "256", "ext": "m4a"},
+    "Opus · Best":     {"codec": "opus", "q": "0",   "ext": "opus"},
+}
+THREADS = {"1 · Sequential": 1, "3 · Parallel": 3, "5 · Parallel": 5}
+DEFAULTS = {
+    "output_dir": str(Path.home() / "Music" / "SonicGrabber"),
+    "format": "MP3 · 320 kbps", "threads": "1 · Sequential",
+    "embed_meta": True, "embed_lyrics": True, "save_lrc": False,
+    "normalize": False, "skip_existing": True, "geometry": "1080x720",
+}
+
+BG      = "#0d0d0f"
+CARD    = "#16161a"
+HOVER   = "#1e1e24"
+BORDER  = "#2a2a32"
+ACCENT  = "#7c5cfc"
+ACCENT2 = "#6344e0"
+GREEN   = "#22c55e"
+RED     = "#ef4444"
+AMBER   = "#f59e0b"
+DIM     = "#8b8b96"
+TEXT    = "#f0f0f4"
 
 
-def find_ffmpeg_path() -> str | None:
-    """Locate FFmpeg executable directory automatically."""
-    ffmpeg_in_path = shutil.which("ffmpeg")
-    if ffmpeg_in_path and shutil.which("ffprobe"):
-        return str(Path(ffmpeg_in_path).parent)
-    
-    user_home = Path.home()
-    winget_packages = user_home / "AppData/Local/Microsoft/WinGet/Packages"
-    if winget_packages.exists():
-        matches = list(winget_packages.rglob("ffprobe.exe"))
-        if matches:
-            return str(matches[0].parent)
-            
-    links_path = user_home / "AppData/Local/Microsoft/WinGet/Links"
-    if (links_path / "ffmpeg.exe").exists():
-        return str(links_path)
+def load_cfg():
+    if CFG.exists():
+        try: return {**DEFAULTS, **json.loads(CFG.read_text("utf-8"))}
+        except: pass
+    return dict(DEFAULTS)
 
+def save_cfg(c):
+    try: CFG.write_text(json.dumps(c, indent=2), "utf-8")
+    except: pass
+
+def safe_name(n):
+    return re.sub(r'[\\/*?:"<>|]', "", n).strip().strip(".")[:150] or "Untitled"
+
+def ensure_dir(p: Path) -> Path:
+    try: p.mkdir(parents=True, exist_ok=True)
+    except OSError: pass
+    return p
+
+def fmt_dur(s):
+    if not s: return "—"
+    m, sec = divmod(int(s), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+def is_url(text):
+    return text.startswith("http://") or text.startswith("https://")
+
+def is_music(entry):
+    title = (entry.get("title") or "").lower()
+    hard_skip = ["interview", "behind the scenes", "documentary",
+                 "reaction video", "commentary", "making of"]
+    return not any(k in title for k in hard_skip)
+
+def find_ffmpeg():
+    exe = shutil.which("ffmpeg")
+    if exe:
+        d = str(Path(exe).resolve().parent)
+        probe = "ffprobe.exe" if sys.platform == "win32" else "ffprobe"
+        if (Path(d) / probe).exists(): return d
+    if sys.platform == "win32":
+        for c in [Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Links",
+                  Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages",
+                  Path(r"C:\ffmpeg\bin"), Path(r"C:\tools\ffmpeg\bin")]:
+            if not c.exists(): continue
+            hits = list(c.rglob("ffmpeg.exe")) if "Packages" in str(c) else [c / "ffmpeg.exe"]
+            for h in hits:
+                if h.exists(): return str(h.parent)
+    elif sys.platform == "darwin":
+        for d in ("/opt/homebrew/bin", "/usr/local/bin"):
+            if Path(d, "ffmpeg").exists(): return d
+    elif sys.platform.startswith("linux"):
+        for d in ("/usr/bin", "/usr/local/bin", "/snap/bin"):
+            if Path(d, "ffmpeg").exists(): return d
     return None
 
-
-def embed_lyrics_to_file(file_path: Path, query_title: str, logger_func=print):
-    """Fetch synced/unsynced lyrics and embed them into the MP3 ID3v2.3 tag for MusicBee."""
-    if file_path.suffix.lower() != ".mp3":
-        return
-
+def ff_ok(d):
+    if not d: return False
+    exe = Path(d) / ("ffmpeg.exe" if sys.platform == "win32" else "ffmpeg")
+    if not exe.exists(): return False
     try:
-        logger_func(f"🎤 Fetching lyrics for: {query_title}...")
-        lrc = syncedlyrics.search(query_title)
-        if lrc:
-            try:
-                audio = ID3(file_path)
-            except ID3NoHeaderError:
-                audio = ID3()
+        subprocess.run([str(exe), "-version"], capture_output=True, timeout=5)
+        return True
+    except: return False
 
-            # Add USLT (Unsynchronized lyrics tag frame readable by MusicBee & phone players)
-            audio.add(USLT(encoding=3, lang='eng', desc='', text=lrc))
-            audio.save(file_path, v2_version=3)
-            logger_func(f"✅ Embedded lyrics into: {file_path.name}")
-        else:
-            logger_func(f"⚠️ No online lyrics found for: {query_title}")
-    except Exception as e:
-        logger_func(f"⚠️ Lyrics embedding skipped for {file_path.name}: {e}")
+def embed_lyrics(fp, title, save_lrc, log):
+    if not LYRICS_OK or not MUTAGEN_OK: return
+    try:
+        txt = syncedlyrics.search(title)
+        if not txt: return
+        if save_lrc: fp.with_suffix(".lrc").write_text(txt, "utf-8")
+        s = fp.suffix.lower()
+        if s == ".mp3":
+            try: a = ID3(fp)
+            except ID3NoHeaderError: a = ID3()
+            a.add(USLT(encoding=3, lang="eng", desc="", text=txt))
+            a.save(fp, v2_version=3)
+        elif s == ".flac":
+            a = FLAC(fp); a["LYRICS"] = txt; a.save()
+        elif s == ".m4a":
+            a = MP4(fp); a["\xa9lyr"] = [txt]; a.save()
+        else: return
+        log(f"✅ Lyrics → {fp.name}")
+    except: pass
+
+def fix_cover(fp, log):
+    if not MUTAGEN_OK or fp.suffix.lower() != ".mp3" or not fp.exists(): return
+    try: a = ID3(fp)
+    except: return
+    pics = a.getall("APIC")
+    if not pics: return
+    best = max(pics, key=lambda f: len(f.data))
+    a.delall("APIC")
+    best.type = 3
+    best.desc = "Cover"
+    if not best.mime or "/" not in best.mime:
+        if best.data[:3] == b"\xff\xd8\xff": best.mime = "image/jpeg"
+        elif best.data[:4] == b"\x89PNG": best.mime = "image/png"
+        else: best.mime = "image/jpeg"
+    a.add(best)
+    a.save(fp, v2_version=3)
+
+class YLog:
+    TAGS = ("[download]", "[ExtractAudio]", "[Metadata]", "[EmbedThumbnail]")
+    def __init__(self, cb): self.cb = cb
+    def debug(self, m):
+        if any(t in m for t in self.TAGS): self.cb(m)
+    def info(self, m): self.cb(m)
+    def warning(self, m): self.cb(f"⚠ {m}")
+    def error(self, m): self.cb(f"❌ {m}")
 
 
-class YTDLPLogger:
-    """Redirect yt-dlp outputs directly to GUI Log Textbox."""
-    def __init__(self, log_callback):
-        self.log = log_callback
-
-    def debug(self, msg):
-        if "[download]" in msg or "[ExtractAudio]" in msg or "[Metadata]" in msg:
-            self.log(msg)
-
-    def info(self, msg):
-        self.log(msg)
-
-    def warning(self, msg):
-        self.log(f"⚠️ {msg}")
-
-    def error(self, msg):
-        self.log(f"❌ {msg}")
+@dataclass
+class Track:
+    title: str
+    artist: str
+    duration: str
+    url: str
+    selected: bool = False
 
 
-class MusicDownloaderApp(ctk.CTk):
+# ══════════════════════════════════════════════════════════════════════════════
+class App(ctk.CTk):
     def __init__(self):
         super().__init__()
+        self.cfg = load_cfg()
+        self.ff = find_ffmpeg()
+        self.ff_ok = ff_ok(self.ff)
+        self.cancel_evt = threading.Event()
+        self.lock = threading.Lock()
+        self.results: List[Track] = []
+        self.worker = None
+        self.downloading = False
 
-        # --- Window Config ---
-        self.title("SonicGrabber Pro - Unified Music Client")
-        self.geometry("780 x 740")
-        self.minsize(700, 650)
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+        self.title(f"{APP} v{VER}")
+        self.geometry(self.cfg.get("geometry", "1080x720"))
+        self.minsize(880, 580)
+        self.configure(fg_color=BG)
 
-        self.default_output = str(Path.home() / "Desktop")
-        self.ffmpeg_dir = find_ffmpeg_path()
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
-        self._build_ui()
+        self._sidebar()
+        self._pages()
+        self._statusbar()
+        self._nav("search")
+        self.protocol("WM_DELETE_WINDOW", self._quit)
+        self._log(f"🚀 {APP} v{VER}")
+        self._log(f"🎬 FFmpeg: {'✔' if self.ff_ok else '✘ NOT FOUND'}")
 
-    def _build_ui(self):
-        # 1. Header Title
-        title_label = ctk.CTkLabel(
-            self, text="🎧 SonicGrabber Pro", font=ctk.CTkFont(size=26, weight="bold")
-        )
-        title_label.pack(pady=(20, 5))
+    # ───────────────── SIDEBAR ──────────────────────────────────────────────
+    def _sidebar(self):
+        sb = ctk.CTkFrame(self, width=200, fg_color=CARD, corner_radius=0)
+        sb.grid(row=0, column=0, sticky="nsew")
+        sb.grid_propagate(False)
 
-        subtitle = ctk.CTkLabel(
-            self, text="High-Res Downloader for Spotify, YouTube, SoundCloud & More", text_color="gray"
-        )
-        subtitle.pack(pady=(0, 15))
+        ctk.CTkLabel(sb, text="🎧", font=ctk.CTkFont(size=30)).pack(anchor="w", padx=20, pady=(28, 4))
+        ctk.CTkLabel(sb, text="SonicGrabber", font=ctk.CTkFont(size=17, weight="bold")).pack(anchor="w", padx=20)
+        ctk.CTkLabel(sb, text=f"v{VER}", font=ctk.CTkFont(size=11), text_color=DIM).pack(anchor="w", padx=20, pady=(0, 28))
 
-        # 2. URL Input Section
-        input_frame = ctk.CTkFrame(self)
-        input_frame.pack(fill="x", padx=20, pady=10)
+        self.nav_btns = {}
+        for key, icon, label in [("search", "🔍", "Search"),
+                                  ("settings", "⚙️", "Settings"),
+                                  ("log", "📋", "Activity Log")]:
+            b = ctk.CTkButton(sb, text=f"  {icon}  {label}", anchor="w", height=42,
+                              font=ctk.CTkFont(size=13), corner_radius=10,
+                              fg_color="transparent", hover_color=HOVER,
+                              text_color=TEXT, command=lambda k=key: self._nav(k))
+            b.pack(fill="x", padx=10, pady=3)
+            self.nav_btns[key] = b
 
-        url_label = ctk.CTkLabel(input_frame, text="Track or Playlist Link:", font=ctk.CTkFont(weight="bold"))
-        url_label.pack(anchor="w", padx=15, pady=(10, 0))
+        ctk.CTkFrame(sb, fg_color="transparent").pack(fill="both", expand=True)
 
-        self.url_entry = ctk.CTkEntry(
-            input_frame, placeholder_text="Paste Spotify, YouTube, or SoundCloud URL here...", width=500
-        )
-        self.url_entry.pack(side="left", fill="x", expand=True, padx=15, pady=10)
+        ff = ctk.CTkFrame(sb, fg_color=HOVER, corner_radius=8)
+        ff.pack(fill="x", padx=12, pady=(0, 16))
+        c = GREEN if self.ff_ok else RED
+        t = "FFmpeg Ready" if self.ff_ok else "FFmpeg Missing"
+        ctk.CTkLabel(ff, text="●", text_color=c, font=ctk.CTkFont(size=11)).pack(side="left", padx=(12, 6), pady=9)
+        ctk.CTkLabel(ff, text=t, font=ctk.CTkFont(size=11), text_color=DIM).pack(side="left", pady=9)
 
-        clear_btn = ctk.CTkButton(input_frame, text="Clear", width=60, fg_color="transparent", border_width=1, command=self._clear_url)
-        clear_btn.pack(side="right", padx=(0, 15), pady=10)
+    # ───────────────── PAGES ────────────────────────────────────────────────
+    def _pages(self):
+        self.main = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        self.main.grid(row=0, column=1, sticky="nsew")
+        self.main.grid_columnconfigure(0, weight=1)
+        self.main.grid_rowconfigure(0, weight=1)
+        self.page_frames = {}
+        self._page_search()
+        self._page_settings()
+        self._page_log()
 
-        # 3. Features & Settings Frame
-        settings_frame = ctk.CTkFrame(self)
-        settings_frame.pack(fill="x", padx=20, pady=10)
+    def _nav(self, key):
+        for k, b in self.nav_btns.items():
+            b.configure(fg_color=ACCENT if k == key else "transparent")
+        for k, f in self.page_frames.items():
+            if k == key: f.grid(row=0, column=0, sticky="nsew")
+            else: f.grid_remove()
 
-        # Audio Quality / Format
-        lbl_format = ctk.CTkLabel(settings_frame, text="Format Quality:", font=ctk.CTkFont(weight="bold"))
-        lbl_format.grid(row=0, column=0, padx=15, pady=10, sticky="w")
+    # ── SEARCH PAGE ─────────────────────────────────────────────────────────
+    def _page_search(self):
+        pg = ctk.CTkFrame(self.main, fg_color="transparent")
+        pg.grid_columnconfigure(0, weight=1)
+        pg.grid_rowconfigure(2, weight=1)
 
-        self.format_menu = ctk.CTkOptionMenu(
-            settings_frame, values=["MP3 (320 kbps)", "FLAC (Lossless)", "M4A (AAC)"]
-        )
-        self.format_menu.grid(row=0, column=1, padx=10, pady=10)
+        # top
+        top = ctk.CTkFrame(pg, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=40, pady=(32, 0))
+        top.grid_columnconfigure(0, weight=1)
 
-        # Parallel Threads
-        lbl_threads = ctk.CTkLabel(settings_frame, text="Parallel Threads:", font=ctk.CTkFont(weight="bold"))
-        lbl_threads.grid(row=0, column=2, padx=15, pady=10, sticky="w")
+        ctk.CTkLabel(top, text="Search music or paste a link",
+                     font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=0, sticky="w")
 
-        self.threads_menu = ctk.CTkOptionMenu(
-            settings_frame, values=["1 Stream", "3 Parallel Streams", "5 Parallel Streams"]
-        )
-        self.threads_menu.grid(row=0, column=3, padx=10, pady=10)
+        bar = ctk.CTkFrame(top, fg_color=CARD, corner_radius=14, height=52)
+        bar.grid(row=1, column=0, sticky="ew", pady=(16, 0))
+        bar.grid_columnconfigure(0, weight=1)
+        bar.grid_propagate(False)
 
-        # Checkboxes: Metadata, Lyrics & Normalization
-        self.meta_var = ctk.BooleanVar(value=True)
-        self.meta_check = ctk.CTkCheckBox(settings_frame, text="Embed Cover Art & Tags", variable=self.meta_var)
-        self.meta_check.grid(row=1, column=0, padx=15, pady=10, sticky="w")
+        self.search_entry = ctk.CTkEntry(
+            bar, placeholder_text="Search songs, artists, playlists — or paste a URL",
+            font=ctk.CTkFont(size=14), fg_color="transparent", border_width=0, height=52)
+        self.search_entry.grid(row=0, column=0, sticky="ew", padx=(18, 8))
+        self.search_entry.bind("<Return>", lambda e: self._search())
 
-        self.lyrics_var = ctk.BooleanVar(value=True)
-        self.lyrics_check = ctk.CTkCheckBox(settings_frame, text="Fetch & Embed Lyrics", variable=self.lyrics_var)
-        self.lyrics_check.grid(row=1, column=1, padx=15, pady=10, sticky="w")
+        self.search_btn = ctk.CTkButton(
+            bar, text="Search", width=100, height=38,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color=ACCENT, hover_color=ACCENT2, command=self._search)
+        self.search_btn.grid(row=0, column=1, padx=7, pady=7)
 
-        self.norm_var = ctk.BooleanVar(value=False)
-        self.norm_check = ctk.CTkCheckBox(settings_frame, text="Volume Normalization", variable=self.norm_var)
-        self.norm_check.grid(row=1, column=2, columnspan=2, padx=15, pady=10, sticky="w")
+        # controls row
+        ctrl = ctk.CTkFrame(pg, fg_color="transparent")
+        ctrl.grid(row=1, column=0, sticky="ew", padx=40, pady=(14, 0))
 
-        # Destination Folder
-        folder_frame = ctk.CTkFrame(self)
-        folder_frame.pack(fill="x", padx=20, pady=10)
+        ctk.CTkLabel(ctrl, text="Format", font=ctk.CTkFont(size=12), text_color=DIM).pack(side="left")
+        self.fmt_menu = ctk.CTkOptionMenu(ctrl, values=list(FORMATS), width=170, height=34,
+                                          fg_color=HOVER, button_color=ACCENT,
+                                          button_hover_color=ACCENT2, font=ctk.CTkFont(size=12))
+        self.fmt_menu.set(self.cfg["format"])
+        self.fmt_menu.pack(side="left", padx=(8, 20))
 
-        folder_label = ctk.CTkLabel(folder_frame, text="Save Folder:", font=ctk.CTkFont(weight="bold"))
-        folder_label.pack(side="left", padx=15, pady=10)
+        ctk.CTkLabel(ctrl, text="Threads", font=ctk.CTkFont(size=12), text_color=DIM).pack(side="left")
+        self.thr_menu = ctk.CTkOptionMenu(ctrl, values=list(THREADS), width=140, height=34,
+                                          fg_color=HOVER, button_color=ACCENT,
+                                          button_hover_color=ACCENT2, font=ctk.CTkFont(size=12))
+        self.thr_menu.set(self.cfg["threads"])
+        self.thr_menu.pack(side="left", padx=(8, 20))
 
-        self.folder_entry = ctk.CTkEntry(folder_frame)
-        self.folder_entry.insert(0, self.default_output)
-        self.folder_entry.pack(side="left", fill="x", expand=True, padx=10, pady=10)
+        ctk.CTkLabel(ctrl, text="Save to", font=ctk.CTkFont(size=12), text_color=DIM).pack(side="left")
+        self.dir_lbl = ctk.CTkLabel(ctrl, text=self.cfg["output_dir"],
+                                    font=ctk.CTkFont(size=11), text_color=DIM, width=180, anchor="w")
+        self.dir_lbl.pack(side="left", padx=(8, 8))
+        ctk.CTkButton(ctrl, text="Change", width=70, height=30,
+                      fg_color=HOVER, hover_color=BORDER,
+                      font=ctk.CTkFont(size=11), command=self._browse).pack(side="left")
 
-        browse_btn = ctk.CTkButton(folder_frame, text="Browse", width=80, command=self._browse_folder)
-        browse_btn.pack(side="right", padx=15, pady=10)
+        self.dl_btn = ctk.CTkButton(
+            ctrl, text="⬇  Download All", width=170, height=36,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color=GREEN, hover_color="#16a34a",
+            command=self._download_selected, state="disabled")
+        self.dl_btn.pack(side="right")
 
-        # 4. Main Action Button & Progress Indicator
-        self.download_btn = ctk.CTkButton(
-            self, text="⚡ START DOWNLOAD", font=ctk.CTkFont(size=16, weight="bold"), height=45, command=self._start_download
-        )
-        self.download_btn.pack(fill="x", padx=20, pady=(10, 5))
+        self.cancel_btn = ctk.CTkButton(
+            ctrl, text="✖ Cancel", width=90, height=36,
+            font=ctk.CTkFont(size=12), fg_color=RED, hover_color="#dc2626",
+            command=self._cancel, state="disabled")
+        self.cancel_btn.pack(side="right", padx=(0, 10))
 
-        self.progress_bar = ctk.CTkProgressBar(self)
-        self.progress_bar.pack(fill="x", padx=20, pady=5)
-        self.progress_bar.set(0)
+        # results
+        results_wrap = ctk.CTkFrame(pg, fg_color="transparent")
+        results_wrap.grid(row=2, column=0, sticky="nsew", padx=40, pady=(16, 24))
+        results_wrap.grid_columnconfigure(0, weight=1)
+        results_wrap.grid_rowconfigure(0, weight=1)
 
-        # 5. Live Console Output Log
-        log_label = ctk.CTkLabel(self, text="Activity Console Log:", font=ctk.CTkFont(weight="bold"))
-        log_label.pack(anchor="w", padx=20, pady=(10, 0))
+        self.results_scroll = ctk.CTkScrollableFrame(
+            results_wrap, fg_color="transparent",
+            scrollbar_button_color=HOVER, scrollbar_button_hover_color=BORDER)
+        self.results_scroll.grid(row=0, column=0, sticky="nsew")
+        self.results_scroll.grid_columnconfigure(0, weight=1)
 
-        self.log_textbox = ctk.CTkTextbox(self, height=180, font=ctk.CTkFont(family="Consolas", size=12))
-        self.log_textbox.pack(fill="both", expand=True, padx=20, pady=(5, 20))
+        ctk.CTkLabel(self.results_scroll,
+                     text="Type a search query and hit Enter.\nResults appear here.",
+                     font=ctk.CTkFont(size=14), text_color=DIM, justify="center"
+                     ).pack(expand=True, pady=80)
 
-    # --- UI Helpers ---
-    def _clear_url(self):
-        self.url_entry.delete(0, "end")
+        self.page_frames["search"] = pg
 
-    def _browse_folder(self):
-        folder = ctk.filedialog.askdirectory()
-        if folder:
-            self.folder_entry.delete(0, "end")
-            self.folder_entry.insert(0, folder)
+    # ── SETTINGS PAGE ───────────────────────────────────────────────────────
+    def _page_settings(self):
+        pg = ctk.CTkFrame(self.main, fg_color="transparent")
+        pg.grid_columnconfigure(0, weight=1)
+        pg.grid_columnconfigure(1, weight=1)
+        pg.grid_rowconfigure(1, weight=1)
 
-    def log(self, message: str):
-        """Thread-safe logging helper."""
-        self.log_textbox.insert("end", message + "\n")
-        self.log_textbox.see("end")
+        ctk.CTkLabel(pg, text="Settings", font=ctk.CTkFont(size=24, weight="bold")
+                     ).grid(row=0, column=0, columnspan=2, sticky="w", padx=40, pady=(32, 20))
 
-    # --- Core Download Router ---
-    def _start_download(self):
-        url = self.url_entry.get().strip()
-        if not url:
-            self.log("⚠️ Please paste a valid URL before downloading.")
+        left = ctk.CTkFrame(pg, fg_color=CARD, corner_radius=14)
+        left.grid(row=1, column=0, sticky="nsew", padx=(40, 10), pady=(0, 32))
+
+        ctk.CTkLabel(left, text="Features", font=ctk.CTkFont(size=16, weight="bold")
+                     ).pack(anchor="w", padx=24, pady=(20, 14))
+
+        self.v_meta = ctk.BooleanVar(value=self.cfg["embed_meta"])
+        self.v_lyr  = ctk.BooleanVar(value=self.cfg["embed_lyrics"])
+        self.v_lrc  = ctk.BooleanVar(value=self.cfg["save_lrc"])
+        self.v_norm = ctk.BooleanVar(value=self.cfg["normalize"])
+        self.v_skip = ctk.BooleanVar(value=self.cfg["skip_existing"])
+
+        for txt, var in [("Embed cover art & metadata", self.v_meta),
+                         ("Fetch & embed lyrics", self.v_lyr),
+                         ("Save .lrc file alongside", self.v_lrc),
+                         ("Volume normalization", self.v_norm),
+                         ("Skip already downloaded", self.v_skip)]:
+            ctk.CTkCheckBox(left, text=txt, variable=var, font=ctk.CTkFont(size=13),
+                            fg_color=ACCENT, hover_color=ACCENT2
+                            ).pack(anchor="w", padx=24, pady=6)
+        ctk.CTkFrame(left, height=20, fg_color="transparent").pack()
+
+        right = ctk.CTkFrame(pg, fg_color=CARD, corner_radius=14)
+        right.grid(row=1, column=1, sticky="nsew", padx=(10, 40), pady=(0, 32))
+
+        ctk.CTkLabel(right, text="System", font=ctk.CTkFont(size=16, weight="bold")
+                     ).pack(anchor="w", padx=24, pady=(20, 14))
+        for ln in [f"Python   {sys.version.split()[0]}",
+                   f"FFmpeg   {'✔ Found' if self.ff_ok else '✘ Missing'}",
+                   f"Lyrics   {'✔' if LYRICS_OK else '✘'}",
+                   f"Mutagen  {'✔' if MUTAGEN_OK else '✘'}"]:
+            ctk.CTkLabel(right, text=ln, font=ctk.CTkFont(family="Consolas", size=12),
+                         text_color=DIM).pack(anchor="w", padx=24, pady=3)
+        ctk.CTkFrame(right, height=24, fg_color="transparent").pack()
+        ctk.CTkButton(right, text="Reset All Settings", width=180, height=36,
+                      fg_color=RED, hover_color="#dc2626",
+                      font=ctk.CTkFont(size=13), command=self._reset
+                      ).pack(anchor="w", padx=24, pady=(0, 20))
+
+        self.page_frames["settings"] = pg
+
+    # ── LOG PAGE ────────────────────────────────────────────────────────────
+    def _page_log(self):
+        pg = ctk.CTkFrame(self.main, fg_color="transparent")
+        pg.grid_columnconfigure(0, weight=1)
+        pg.grid_rowconfigure(1, weight=1)
+
+        hdr = ctk.CTkFrame(pg, fg_color="transparent")
+        hdr.grid(row=0, column=0, sticky="ew", padx=40, pady=(32, 12))
+        ctk.CTkLabel(hdr, text="Activity Log", font=ctk.CTkFont(size=24, weight="bold")).pack(side="left")
+        ctk.CTkButton(hdr, text="Copy", width=70, height=32, fg_color=HOVER, hover_color=BORDER,
+                      font=ctk.CTkFont(size=12), command=self._copy_log).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(hdr, text="Clear", width=70, height=32, fg_color=HOVER, hover_color=BORDER,
+                      font=ctk.CTkFont(size=12), command=self._clear_log).pack(side="right")
+
+        self.log_text = ctk.CTkTextbox(pg, font=ctk.CTkFont(family="Consolas", size=12),
+                                       fg_color=CARD, state="disabled", wrap="word",
+                                       scrollbar_button_color=HOVER,
+                                       scrollbar_button_hover_color=BORDER)
+        self.log_text.grid(row=1, column=0, sticky="nsew", padx=40, pady=(0, 28))
+        self.page_frames["log"] = pg
+
+    # ───────────────── STATUS BAR ───────────────────────────────────────────
+    def _statusbar(self):
+        sb = ctk.CTkFrame(self, height=30, fg_color=CARD, corner_radius=0)
+        sb.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.sb_dot = ctk.CTkLabel(sb, text="●", text_color=DIM, font=ctk.CTkFont(size=11))
+        self.sb_dot.pack(side="left", padx=(14, 6), pady=5)
+        self.sb_txt = ctk.CTkLabel(sb, text="Ready", font=ctk.CTkFont(size=11), text_color=DIM)
+        self.sb_txt.pack(side="left", pady=5)
+
+    # ───────────────── SEARCH ───────────────────────────────────────────────
+    def _search(self):
+        q = self.search_entry.get().strip()
+        if not q:
             return
 
-        self.download_btn.configure(state="disabled", text="⏳ Downloading...")
-        self.progress_bar.configure(mode="indeterminate")
-        self.progress_bar.start()
+        if is_url(q):
+            self._download_urls([q])
+            return
 
-        threading.Thread(target=self._download_worker, args=(url,), daemon=True).start()
+        self.search_btn.configure(state="disabled", text="…")
+        self.dl_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="disabled")
 
-    def _download_worker(self, url: str):
-        output_dir = Path(self.folder_entry.get().strip())
-        selected_fmt = self.format_menu.get()
-        threads_count = int(self.threads_menu.get().split()[0])
+        for w in self.results_scroll.winfo_children():
+            w.destroy()
 
-        self.log(f"\n🚀 Starting download session for: {url}")
-        self.log(f"📁 Output Directory: {output_dir}")
+        ctk.CTkLabel(self.results_scroll, text="🔍  Searching…",
+                     font=ctk.CTkFont(size=14), text_color=DIM).pack(pady=60)
 
+        threading.Thread(target=self._search_worker, args=(q,), daemon=True).start()
+
+    def _search_worker(self, query):
         try:
-            if "spotify.com" in url:
-                self._process_spotify(url, output_dir, selected_fmt, threads_count)
-            else:
-                self._process_yt_dlp(url, output_dir, selected_fmt, threads_count)
+            self._log(f"🔍 Searching: {query}")
+            search_query = f"ytsearch25:{query}"
+            opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "skip_download": True}
 
-            self.log("🎉 Download session complete!\n" + ("=" * 50))
-        except Exception as e:
-            self.log(f"❌ Error during execution: {e}")
-        finally:
-            self.progress_bar.stop()
-            self.progress_bar.configure(mode="determinate")
-            self.progress_bar.set(1.0)
-            self.download_btn.configure(state="normal", text="⚡ START DOWNLOAD")
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(search_query, download=False)
 
-    # --- Spotify Processing Engine ---
-    def _process_spotify(self, url: str, output_dir: Path, fmt: str, threads: int):
-        self.log("🟢 Platform: Spotify detected (Querying metadata & matching audio streams...)")
-        
-        spotdl_client = Spotdl(
-            downsampling=False,
-            headful=False,
-            max_workers=threads
-        )
+            if not info:
+                self._log("⚠ No data returned")
+                self.after(0, lambda: self._show_results([]))
+                return
 
-        songs = spotdl_client.download_songs([url])
-        self.log(f"✅ Downloaded {len(songs)} track(s) from Spotify!")
+            entries = info.get("entries") or []
+            self._log(f"   ↳ Raw: {len(entries)}")
 
-    # --- General (YouTube / SoundCloud) Engine ---
-    def _process_yt_dlp(self, url: str, output_dir: Path, fmt: str, threads: int):
-        self.log("🔴 Platform: YouTube / Web source detected.")
+            tracks = []
+            for e in entries:
+                if not e: continue
+                if not is_music(e): continue
 
-        codec = "mp3"
-        quality = "320"
-        if "FLAC" in fmt:
-            codec = "flac"
-            quality = "0"
-        elif "M4A" in fmt:
-            codec = "m4a"
-            quality = "256"
+                vid = e.get("id") or ""
+                if not vid:
+                    url = e.get("url") or e.get("webpage_url") or ""
+                    if "watch?v=" in url:
+                        vid = url.split("watch?v=")[-1].split("&")[0]
+                    elif "youtu.be/" in url:
+                        vid = url.split("youtu.be/")[-1].split("?")[0]
+                if not vid: continue
 
-        postprocessors = [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': codec,
-            'preferredquality': quality,
-        }]
+                tracks.append(Track(
+                    title=e.get("title") or "Unknown",
+                    artist=e.get("channel") or e.get("uploader") or "",
+                    duration=fmt_dur(e.get("duration")) if e.get("duration") else "—",
+                    url=f"https://www.youtube.com/watch?v={vid}",
+                ))
 
-        if self.meta_var.get():
-            postprocessors.append({'key': 'FFmpegMetadata'})
-            postprocessors.append({'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg'})
-            postprocessors.append({'key': 'EmbedThumbnail'})
+            self._log(f"   ↳ Results: {len(tracks)}")
+            self.after(0, lambda: self._show_results(tracks))
 
-        # Build FFmpeg Postprocessor Arguments (Forces ID3v2.3 for MusicBee Compatibility!)
-        ffmpeg_args = ['-id3v2_version', '3']
-        if self.norm_var.get():
-            ffmpeg_args.extend(['-af', 'loudnorm=I=-16:TP=-1.5:LRA=11'])
+        except Exception as ex:
+            self._log(f"❌ Search error: {ex}")
+            self.after(0, lambda: self._show_results([]))
 
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'noplaylist': False,
-            'download_archive': str(output_dir / 'download_archive.txt'),
-            'socket_timeout': 30,
-            'retries': 10,
-            'writethumbnails': self.meta_var.get(),
-            'postprocessors': postprocessors,
-            'postprocessor_args': {'ffmpeg': ffmpeg_args},
-            'logger': YTDLPLogger(self.log),
-            'quiet': False,
-            'no_warnings': True,
+    def _show_results(self, tracks):
+        self.results = tracks
+        self.search_btn.configure(state="normal", text="Search")
+
+        for w in self.results_scroll.winfo_children():
+            w.destroy()
+
+        if not tracks:
+            ctk.CTkLabel(self.results_scroll, text="No results found.",
+                         font=ctk.CTkFont(size=14), text_color=DIM).pack(pady=60)
+            return
+
+        for i, t in enumerate(tracks):
+            self._result_card(t, i)
+
+        self.dl_btn.configure(state="normal", text=f"⬇  Download All ({len(tracks)})")
+
+    def _result_card(self, t: Track, idx):
+        card = ctk.CTkFrame(self.results_scroll, fg_color=CARD, corner_radius=10,
+                            border_width=1, border_color=BORDER)
+        card.pack(fill="x", pady=3)
+        card.grid_columnconfigure(2, weight=1)
+
+        var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(card, text="", variable=var, width=28,
+                        fg_color=ACCENT, hover_color=ACCENT2,
+                        command=lambda v=var, tr=t: self._toggle(tr, v)
+                        ).grid(row=0, column=0, padx=(14, 10), pady=12)
+
+        ctk.CTkLabel(card, text=f"{idx + 1:02d}", font=ctk.CTkFont(size=12),
+                     text_color=DIM, width=24).grid(row=0, column=1, padx=(0, 6))
+
+        info = ctk.CTkFrame(card, fg_color="transparent")
+        info.grid(row=0, column=2, sticky="ew", padx=(0, 12), pady=10)
+        ctk.CTkLabel(info, text=t.title, anchor="w",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(fill="x")
+        ctk.CTkLabel(info, text=f"{t.artist}  ·  {t.duration}", anchor="w",
+                     font=ctk.CTkFont(size=11), text_color=DIM).pack(fill="x", pady=(2, 0))
+
+        ctk.CTkButton(card, text="⬇", width=36, height=32,
+                      fg_color="transparent", hover_color=ACCENT,
+                      text_color=DIM, font=ctk.CTkFont(size=14),
+                      command=lambda u=t.url: self._download_urls([u])
+                      ).grid(row=0, column=3, padx=(0, 14))
+
+        card.bind("<Enter>", lambda e, c=card: c.configure(fg_color=HOVER))
+        card.bind("<Leave>", lambda e, c=card: c.configure(fg_color=CARD))
+
+    def _toggle(self, track, var):
+        track.selected = var.get()
+        sel = sum(1 for t in self.results if t.selected)
+        if sel:
+            self.dl_btn.configure(text=f"⬇  Download Selected ({sel})")
+        else:
+            self.dl_btn.configure(text=f"⬇  Download All ({len(self.results)})")
+
+    # ───────────────── DOWNLOAD ─────────────────────────────────────────────
+    def _download_selected(self):
+        sel = [t.url for t in self.results if t.selected]
+        if not sel:
+            sel = [t.url for t in self.results]
+        if sel:
+            self._download_urls(sel)
+
+    def _download_urls(self, urls):
+        if not urls: return
+        if not self.ff_ok:
+            messagebox.showerror("Error", "FFmpeg not found. Install it first.")
+            return
+
+        self.downloading = True
+        self.dl_btn.configure(state="disabled", text="⏳ Downloading…")
+        self.cancel_btn.configure(state="normal")
+        self.cancel_evt.clear()
+        self._set_status("Downloading…", AMBER)
+        self._log(f"🚀 Downloading {len(urls)} item(s)")
+        self._nav("search")
+
+        self.worker = threading.Thread(target=self._dl_worker, args=(urls,), daemon=True)
+        self.worker.start()
+
+    def _cancel(self):
+        self.cancel_evt.set()
+        self._log("🛑 Cancel requested")
+        self.cancel_btn.configure(state="disabled")
+
+    def _dl_worker(self, urls):
+        out = ensure_dir(Path(self.cfg["output_dir"]))
+        fmt = self.fmt_menu.get()
+        fi = FORMATS.get(fmt, FORMATS["MP3 · 320 kbps"])
+
+        success = 0
+        failed = 0
+
+        for i, url in enumerate(urls, 1):
+            if self.cancel_evt.is_set():
+                self._log("🛑 Cancelled")
+                break
+            self._set_status(f"[{i}/{len(urls)}] Downloading…", AMBER)
+            try:
+                self._dl_one(url, out, fi)
+                success += 1
+                self._log(f"✅ [{i}/{len(urls)}] Done")
+            except yt_dlp.utils.DownloadCancelled:
+                self._log("🛑 Cancelled")
+                break
+            except Exception as e:
+                failed += 1
+                self._log(f"❌ [{i}/{len(urls)}] {str(e)[:120]}")
+
+        self._set_status("Ready", DIM)
+        self.downloading = False
+        self.after(0, lambda: self.dl_btn.configure(state="normal", text="⬇  Download"))
+        self.after(0, lambda: self.cancel_btn.configure(state="disabled"))
+        self._log(f"🎉 Complete: {success} succeeded, {failed} failed")
+
+    def _dl_one(self, url, out: Path, fi):
+        # Detect if this is a playlist URL
+        is_playlist = ("list=" in url or "/playlist" in url) and "watch?v=" not in url.split("list=")[0] if "list=" in url else "/playlist" in url
+
+        # Simpler check:
+        is_playlist = "list=" in url and "watch?v=" not in url
+
+        pp = [{"key": "FFmpegExtractAudio",
+               "preferredcodec": fi["codec"],
+               "preferredquality": fi["q"]}]
+
+        if self.v_meta.get():
+            pp += [
+                {"key": "FFmpegMetadata", "add_metadata": True},
+                {"key": "EmbedThumbnail"},
+            ]
+
+        ppa = {}
+        if fi["codec"] == "mp3":
+            ppa["extractaudio"] = ["-id3v2_version", "3"]
+            ppa["metadata"] = ["-id3v2_version", "3"]
+        if self.v_norm.get():
+            ppa.setdefault("extractaudio", []).extend(
+                ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"])
+
+        def hook(d):
+            if self.cancel_evt.is_set():
+                raise yt_dlp.utils.DownloadCancelled
+            if d.get("status") == "downloading":
+                pct = d.get("_percent_str", "").strip()
+                spd = d.get("_speed_str", "").strip()
+                self._set_status(f"⬇ {pct}  {spd}", AMBER)
+
+        # ── KEY FIX: playlist gets its own subfolder ──
+        if is_playlist:
+            outtmpl = str(out / "%(playlist_title,Playlist)s" / "%(playlist_index)02d - %(title)s.%(ext)s")
+            noplaylist = False
+        else:
+            outtmpl = str(out / "%(title)s.%(ext)s")
+            noplaylist = True
+
+        opts = {
+            "format": "bestaudio/best",
+            "noplaylist": noplaylist,
+            "socket_timeout": 30,
+            "retries": 5,
+            "fragment_retries": 5,
+            "writethumbnail": self.v_meta.get(),
+            "postprocessors": pp,
+            "postprocessor_args": ppa,
+            "progress_hooks": [hook],
+            "logger": YLog(self._log),
+            "quiet": False,
+            "no_warnings": True,
+            "ignoreerrors": True,
+            "playlist_items": "1-500",
+            "extractor_args": {
+                "youtube": {"player_client": ["web", "android", "ios"]}
+            },
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/125.0.0.0 Safari/537.36",
+            },
+            "outtmpl": outtmpl,
         }
 
-        if self.ffmpeg_dir:
-            ydl_opts['ffmpeg_location'] = self.ffmpeg_dir
+        if self.v_skip.get():
+            opts["download_archive"] = str(out / ".sg_archive.txt")
+        if self.ff_ok and self.ff:
+            opts["ffmpeg_location"] = self.ff
 
-        # Helper to process single song lyrics after download
-        def post_process_file(file_path: Path, title_hint: str):
-            if self.lyrics_var.get() and file_path.exists():
-                embed_lyrics_to_file(file_path, title_hint, self.log)
-
-        # Multithreaded Execution
-        if threads > 1:
-            self.log(f"⚡ True Multithreading Enabled: {threads} workers active.")
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                self.log("🔍 Extracting playlist info...")
-                info = ydl.extract_info(url, download=False)
-                
-                if 'entries' in info:
-                    entries = list(info['entries'])
-                    playlist_name = info.get('title', 'Music')
-                    playlist_folder = output_dir / playlist_name
-                    playlist_folder.mkdir(parents=True, exist_ok=True)
-                    self.log(f"📋 Found Playlist: '{playlist_name}' with {len(entries)} tracks.")
-
-                    def download_track(entry_data):
-                        idx, entry = entry_data
-                        if not entry: return
-                        track_url = entry.get('webpage_url') or entry.get('url')
-                        title = entry.get('title', f'Track_{idx}')
-                        if not track_url: return
-
-                        track_opts = ydl_opts.copy()
-                        file_stem = f"{idx:02d} - {title}"
-                        track_opts['outtmpl'] = str(playlist_folder / f"{file_stem}.%(ext)s")
-                        
-                        try:
-                            with yt_dlp.YoutubeDL(track_opts) as worker_ydl:
-                                worker_ydl.download([track_url])
-                            
-                            # Embed Lyrics
-                            expected_file = playlist_folder / f"{file_stem}.{codec}"
-                            post_process_file(expected_file, title)
-
-                        except Exception as e:
-                            self.log(f"⚠️ Error on track {idx}: {e}")
-
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-                        executor.map(download_track, enumerate(entries, start=1))
-                    return
-
-        # Sequential Execution
-        ydl_opts['outtmpl'] = str(output_dir / '%(playlist_title,Music)s/%(playlist_index&{} - |)s%(title)s.%(ext)s')
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            if info and self.lyrics_var.get():
-                title = info.get('title', '')
-                filename = ydl.prepare_filename(info)
-                file_path = Path(filename).with_suffix(f".{codec}")
-                post_process_file(file_path, title)
+
+        # Post-process
+        if info and (self.v_meta.get() or self.v_lyr.get()):
+            entries = info.get("entries") or [info]
+            for ent in entries:
+                if not ent:
+                    continue
+                try:
+                    fn = ydl.prepare_filename(ent)
+                    fp = Path(fn).with_suffix(f".{fi['ext']}")
+                    if fp.exists():
+                        if self.v_meta.get():
+                            fix_cover(fp, self._log)
+                        if self.v_lyr.get():
+                            embed_lyrics(fp, ent.get("title", ""),
+                                         self.v_lrc.get(), self._log)
+                except Exception:
+                    pass
+
+    # ───────────────── HELPERS ──────────────────────────────────────────────
+    def _browse(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.cfg["output_dir"] = d
+            self.dir_lbl.configure(text=d)
+            save_cfg(self.cfg)
+
+    def _reset(self):
+        save_cfg(dict(DEFAULTS))
+        messagebox.showinfo("Reset", "Settings reset. Restart to apply.")
+
+    def _copy_log(self):
+        self.log_text.configure(state="normal")
+        c = self.log_text.get("1.0", "end")
+        self.log_text.configure(state="disabled")
+        self.clipboard_clear()
+        self.clipboard_append(c)
+
+    def _clear_log(self):
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+
+    def _log(self, m):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.after(0, lambda: self._ap(f"[{ts}] {m}"))
+
+    def _ap(self, t):
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", t + "\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _set_status(self, txt, color):
+        self.sb_txt.configure(text=txt)
+        self.sb_dot.configure(text_color=color)
+
+    def _quit(self):
+        self.cancel_evt.set()
+        if self.worker and self.worker.is_alive():
+            self.worker.join(timeout=3)
+        self.cfg["geometry"] = self.geometry()
+        save_cfg(self.cfg)
+        self.destroy()
 
 
 if __name__ == "__main__":
-    app = MusicDownloaderApp()
-    app.mainloop()
+    ff = find_ffmpeg()
+    print("=" * 52)
+    print(f"  {APP} v{VER}")
+    print(f"  FFmpeg: {ff if ff_ok(ff) else 'NOT FOUND'}")
+    print(f"  lyrics: {LYRICS_OK}  mutagen: {MUTAGEN_OK}")
+    print("=" * 52)
+    App().mainloop()
