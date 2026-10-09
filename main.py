@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""SonicGrabber Pro v5.1 – Unified search, y2mate-inspired, all bugs fixed."""
+"""SonicGrabber Pro v5.3 – Fixed thumbnails, search bar, robust state."""
 
 import os, re, sys, json, copy, shutil, subprocess, threading
 import concurrent.futures
+import io
+import hashlib
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
@@ -11,6 +14,12 @@ from typing import List
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import yt_dlp
+
+try:
+    from PIL import Image
+    PIL_OK = True
+except Exception:
+    PIL_OK = False
 
 try:
     import syncedlyrics; LYRICS_OK = True
@@ -23,8 +32,9 @@ try:
 except Exception: MUTAGEN_OK = False
 
 APP = "SonicGrabber Pro"
-VER = "5.1.0"
+VER = "5.3.0"
 CFG = Path.home() / ".sonicgrabber_v5.json"
+THUMB_CACHE = Path.home() / ".sonicgrabber_thumbs"
 
 FORMATS = {
     "MP3 · 320 kbps":  {"codec": "mp3",  "q": "320", "ext": "mp3"},
@@ -37,20 +47,12 @@ DEFAULTS = {
     "output_dir": str(Path.home() / "Music" / "SonicGrabber"),
     "format": "MP3 · 320 kbps", "threads": "1 · Sequential",
     "embed_meta": True, "embed_lyrics": True, "save_lrc": False,
-    "normalize": False, "skip_existing": True, "geometry": "1080x720",
+    "normalize": False, "skip_existing": True, "geometry": "1100x740",
 }
 
-BG      = "#0d0d0f"
-CARD    = "#16161a"
-HOVER   = "#1e1e24"
-BORDER  = "#2a2a32"
-ACCENT  = "#7c5cfc"
-ACCENT2 = "#6344e0"
-GREEN   = "#22c55e"
-RED     = "#ef4444"
-AMBER   = "#f59e0b"
-DIM     = "#8b8b96"
-TEXT    = "#f0f0f4"
+BG = "#0d0d0f"; CARD = "#16161a"; HOVER = "#1e1e24"; BORDER = "#2a2a32"
+ACCENT = "#7c5cfc"; ACCENT2 = "#6344e0"; GREEN = "#22c55e"; RED = "#ef4444"
+AMBER = "#f59e0b"; DIM = "#8b8b96"; TEXT = "#f0f0f4"
 
 
 def load_cfg():
@@ -93,11 +95,11 @@ def find_ffmpeg():
         probe = "ffprobe.exe" if sys.platform == "win32" else "ffprobe"
         if (Path(d) / probe).exists(): return d
     if sys.platform == "win32":
-        for c in [Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Links",
-                  Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages",
+        for c in [Path.home()/"AppData"/"Local"/"Microsoft"/"WinGet"/"Links",
+                  Path.home()/"AppData"/"Local"/"Microsoft"/"WinGet"/"Packages",
                   Path(r"C:\ffmpeg\bin"), Path(r"C:\tools\ffmpeg\bin")]:
             if not c.exists(): continue
-            hits = list(c.rglob("ffmpeg.exe")) if "Packages" in str(c) else [c / "ffmpeg.exe"]
+            hits = list(c.rglob("ffmpeg.exe")) if "Packages" in str(c) else [c/"ffmpeg.exe"]
             for h in hits:
                 if h.exists(): return str(h.parent)
     elif sys.platform == "darwin":
@@ -129,10 +131,8 @@ def embed_lyrics(fp, title, save_lrc, log):
             except ID3NoHeaderError: a = ID3()
             a.add(USLT(encoding=3, lang="eng", desc="", text=txt))
             a.save(fp, v2_version=3)
-        elif s == ".flac":
-            a = FLAC(fp); a["LYRICS"] = txt; a.save()
-        elif s == ".m4a":
-            a = MP4(fp); a["\xa9lyr"] = [txt]; a.save()
+        elif s == ".flac": a = FLAC(fp); a["LYRICS"] = txt; a.save()
+        elif s == ".m4a": a = MP4(fp); a["\xa9lyr"] = [txt]; a.save()
         else: return
         log(f"✅ Lyrics → {fp.name}")
     except: pass
@@ -144,24 +144,21 @@ def fix_cover(fp, log):
     pics = a.getall("APIC")
     if not pics: return
     best = max(pics, key=lambda f: len(f.data))
-    a.delall("APIC")
-    best.type = 3
-    best.desc = "Cover"
+    a.delall("APIC"); best.type = 3; best.desc = "Cover"
     if not best.mime or "/" not in best.mime:
         if best.data[:3] == b"\xff\xd8\xff": best.mime = "image/jpeg"
         elif best.data[:4] == b"\x89PNG": best.mime = "image/png"
         else: best.mime = "image/jpeg"
-    a.add(best)
-    a.save(fp, v2_version=3)
+    a.add(best); a.save(fp, v2_version=3)
 
 class YLog:
     TAGS = ("[download]", "[ExtractAudio]", "[Metadata]", "[EmbedThumbnail]")
-    def __init__(self, cb): self.cb = cb
-    def debug(self, m):
-        if any(t in m for t in self.TAGS): self.cb(m)
-    def info(self, m): self.cb(m)
-    def warning(self, m): self.cb(f"⚠ {m}")
-    def error(self, m): self.cb(f"❌ {m}")
+    def __init__(s, cb): s.cb = cb
+    def debug(s, m):
+        if any(t in m for t in s.TAGS): s.cb(m)
+    def info(s, m): s.cb(m)
+    def warning(s, m): s.cb(f"⚠ {m}")
+    def error(s, m): s.cb(f"❌ {m}")
 
 
 @dataclass
@@ -170,10 +167,11 @@ class Track:
     artist: str
     duration: str
     url: str
+    thumbnail: str = ""
+    views: str = ""
     selected: bool = False
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -185,12 +183,15 @@ class App(ctk.CTk):
         self.results: List[Track] = []
         self.worker = None
         self.downloading = False
+        self.search_gen = 0  # generation counter to kill stale thumbnail threads
+
+        ensure_dir(THUMB_CACHE)
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
         self.title(f"{APP} v{VER}")
-        self.geometry(self.cfg.get("geometry", "1080x720"))
-        self.minsize(880, 580)
+        self.geometry(self.cfg.get("geometry", "1100x740"))
+        self.minsize(900, 600)
         self.configure(fg_color=BG)
 
         self.grid_columnconfigure(1, weight=1)
@@ -202,7 +203,8 @@ class App(ctk.CTk):
         self._nav("search")
         self.protocol("WM_DELETE_WINDOW", self._quit)
         self._log(f"🚀 {APP} v{VER}")
-        self._log(f"🎬 FFmpeg: {'✔' if self.ff_ok else '✘ NOT FOUND'}")
+        self._log(f"🎬 FFmpeg: {'✔' if self.ff_ok else '✘'}")
+        self._log(f"🖼  Thumbnails: {'✔' if PIL_OK else '✘ (pip install Pillow)'}")
 
     # ───────────────── SIDEBAR ──────────────────────────────────────────────
     def _sidebar(self):
@@ -258,16 +260,15 @@ class App(ctk.CTk):
         pg.grid_columnconfigure(0, weight=1)
         pg.grid_rowconfigure(2, weight=1)
 
-        # top
         top = ctk.CTkFrame(pg, fg_color="transparent")
-        top.grid(row=0, column=0, sticky="ew", padx=40, pady=(32, 0))
+        top.grid(row=0, column=0, sticky="ew", padx=40, pady=(28, 0))
         top.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(top, text="Search music or paste a link",
                      font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=0, sticky="w")
 
         bar = ctk.CTkFrame(top, fg_color=CARD, corner_radius=14, height=52)
-        bar.grid(row=1, column=0, sticky="ew", pady=(16, 0))
+        bar.grid(row=1, column=0, sticky="ew", pady=(14, 0))
         bar.grid_columnconfigure(0, weight=1)
         bar.grid_propagate(False)
 
@@ -283,9 +284,9 @@ class App(ctk.CTk):
             fg_color=ACCENT, hover_color=ACCENT2, command=self._search)
         self.search_btn.grid(row=0, column=1, padx=7, pady=7)
 
-        # controls row
+        # controls
         ctrl = ctk.CTkFrame(pg, fg_color="transparent")
-        ctrl.grid(row=1, column=0, sticky="ew", padx=40, pady=(14, 0))
+        ctrl.grid(row=1, column=0, sticky="ew", padx=40, pady=(12, 0))
 
         ctk.CTkLabel(ctrl, text="Format", font=ctk.CTkFont(size=12), text_color=DIM).pack(side="left")
         self.fmt_menu = ctk.CTkOptionMenu(ctrl, values=list(FORMATS), width=170, height=34,
@@ -303,7 +304,7 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(ctrl, text="Save to", font=ctk.CTkFont(size=12), text_color=DIM).pack(side="left")
         self.dir_lbl = ctk.CTkLabel(ctrl, text=self.cfg["output_dir"],
-                                    font=ctk.CTkFont(size=11), text_color=DIM, width=180, anchor="w")
+                                    font=ctk.CTkFont(size=11), text_color=DIM, width=160, anchor="w")
         self.dir_lbl.pack(side="left", padx=(8, 8))
         ctk.CTkButton(ctrl, text="Change", width=70, height=30,
                       fg_color=HOVER, hover_color=BORDER,
@@ -323,25 +324,21 @@ class App(ctk.CTk):
         self.cancel_btn.pack(side="right", padx=(0, 10))
 
         # results
-        results_wrap = ctk.CTkFrame(pg, fg_color="transparent")
-        results_wrap.grid(row=2, column=0, sticky="nsew", padx=40, pady=(16, 24))
-        results_wrap.grid_columnconfigure(0, weight=1)
-        results_wrap.grid_rowconfigure(0, weight=1)
+        rw = ctk.CTkFrame(pg, fg_color="transparent")
+        rw.grid(row=2, column=0, sticky="nsew", padx=40, pady=(14, 24))
+        rw.grid_columnconfigure(0, weight=1)
+        rw.grid_rowconfigure(0, weight=1)
 
         self.results_scroll = ctk.CTkScrollableFrame(
-            results_wrap, fg_color="transparent",
+            rw, fg_color="transparent",
             scrollbar_button_color=HOVER, scrollbar_button_hover_color=BORDER)
         self.results_scroll.grid(row=0, column=0, sticky="nsew")
         self.results_scroll.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(self.results_scroll,
-                     text="Type a search query and hit Enter.\nResults appear here.",
-                     font=ctk.CTkFont(size=14), text_color=DIM, justify="center"
-                     ).pack(expand=True, pady=80)
-
+        self._show_hint("Search for music above.\nResults with thumbnails appear here.")
         self.page_frames["search"] = pg
 
-    # ── SETTINGS PAGE ───────────────────────────────────────────────────────
+    # ── SETTINGS ────────────────────────────────────────────────────────────
     def _page_settings(self):
         pg = ctk.CTkFrame(self.main, fg_color="transparent")
         pg.grid_columnconfigure(0, weight=1)
@@ -349,11 +346,10 @@ class App(ctk.CTk):
         pg.grid_rowconfigure(1, weight=1)
 
         ctk.CTkLabel(pg, text="Settings", font=ctk.CTkFont(size=24, weight="bold")
-                     ).grid(row=0, column=0, columnspan=2, sticky="w", padx=40, pady=(32, 20))
+                     ).grid(row=0, column=0, columnspan=2, sticky="w", padx=40, pady=(28, 20))
 
         left = ctk.CTkFrame(pg, fg_color=CARD, corner_radius=14)
-        left.grid(row=1, column=0, sticky="nsew", padx=(40, 10), pady=(0, 32))
-
+        left.grid(row=1, column=0, sticky="nsew", padx=(40, 10), pady=(0, 28))
         ctk.CTkLabel(left, text="Features", font=ctk.CTkFont(size=16, weight="bold")
                      ).pack(anchor="w", padx=24, pady=(20, 14))
 
@@ -367,21 +363,21 @@ class App(ctk.CTk):
                          ("Fetch & embed lyrics", self.v_lyr),
                          ("Save .lrc file alongside", self.v_lrc),
                          ("Volume normalization", self.v_norm),
-                         ("Skip already downloaded", self.v_skip)]:
+                         ("Skip existing (playlist sync)", self.v_skip)]:
             ctk.CTkCheckBox(left, text=txt, variable=var, font=ctk.CTkFont(size=13),
                             fg_color=ACCENT, hover_color=ACCENT2
                             ).pack(anchor="w", padx=24, pady=6)
         ctk.CTkFrame(left, height=20, fg_color="transparent").pack()
 
         right = ctk.CTkFrame(pg, fg_color=CARD, corner_radius=14)
-        right.grid(row=1, column=1, sticky="nsew", padx=(10, 40), pady=(0, 32))
-
+        right.grid(row=1, column=1, sticky="nsew", padx=(10, 40), pady=(0, 28))
         ctk.CTkLabel(right, text="System", font=ctk.CTkFont(size=16, weight="bold")
                      ).pack(anchor="w", padx=24, pady=(20, 14))
-        for ln in [f"Python   {sys.version.split()[0]}",
-                   f"FFmpeg   {'✔ Found' if self.ff_ok else '✘ Missing'}",
-                   f"Lyrics   {'✔' if LYRICS_OK else '✘'}",
-                   f"Mutagen  {'✔' if MUTAGEN_OK else '✘'}"]:
+        for ln in [f"Python    {sys.version.split()[0]}",
+                   f"FFmpeg    {'✔' if self.ff_ok else '✘'}",
+                   f"Lyrics    {'✔' if LYRICS_OK else '✘'}",
+                   f"Mutagen   {'✔' if MUTAGEN_OK else '✘'}",
+                   f"Pillow    {'✔' if PIL_OK else '✘'}"]:
             ctk.CTkLabel(right, text=ln, font=ctk.CTkFont(family="Consolas", size=12),
                          text_color=DIM).pack(anchor="w", padx=24, pady=3)
         ctk.CTkFrame(right, height=24, fg_color="transparent").pack()
@@ -389,28 +385,25 @@ class App(ctk.CTk):
                       fg_color=RED, hover_color="#dc2626",
                       font=ctk.CTkFont(size=13), command=self._reset
                       ).pack(anchor="w", padx=24, pady=(0, 20))
-
         self.page_frames["settings"] = pg
 
-    # ── LOG PAGE ────────────────────────────────────────────────────────────
+    # ── LOG ─────────────────────────────────────────────────────────────────
     def _page_log(self):
         pg = ctk.CTkFrame(self.main, fg_color="transparent")
         pg.grid_columnconfigure(0, weight=1)
         pg.grid_rowconfigure(1, weight=1)
-
         hdr = ctk.CTkFrame(pg, fg_color="transparent")
-        hdr.grid(row=0, column=0, sticky="ew", padx=40, pady=(32, 12))
+        hdr.grid(row=0, column=0, sticky="ew", padx=40, pady=(28, 12))
         ctk.CTkLabel(hdr, text="Activity Log", font=ctk.CTkFont(size=24, weight="bold")).pack(side="left")
         ctk.CTkButton(hdr, text="Copy", width=70, height=32, fg_color=HOVER, hover_color=BORDER,
                       font=ctk.CTkFont(size=12), command=self._copy_log).pack(side="right", padx=(8, 0))
         ctk.CTkButton(hdr, text="Clear", width=70, height=32, fg_color=HOVER, hover_color=BORDER,
                       font=ctk.CTkFont(size=12), command=self._clear_log).pack(side="right")
-
         self.log_text = ctk.CTkTextbox(pg, font=ctk.CTkFont(family="Consolas", size=12),
                                        fg_color=CARD, state="disabled", wrap="word",
                                        scrollbar_button_color=HOVER,
                                        scrollbar_button_hover_color=BORDER)
-        self.log_text.grid(row=1, column=0, sticky="nsew", padx=40, pady=(0, 28))
+        self.log_text.grid(row=1, column=0, sticky="nsew", padx=40, pady=(0, 24))
         self.page_frames["log"] = pg
 
     # ───────────────── STATUS BAR ───────────────────────────────────────────
@@ -423,75 +416,88 @@ class App(ctk.CTk):
         self.sb_txt.pack(side="left", pady=5)
 
     # ───────────────── SEARCH ───────────────────────────────────────────────
+    def _show_hint(self, text):
+        for w in self.results_scroll.winfo_children():
+            w.destroy()
+        ctk.CTkLabel(self.results_scroll, text=text,
+                     font=ctk.CTkFont(size=14), text_color=DIM,
+                     justify="center").pack(expand=True, pady=80)
+
     def _search(self):
         q = self.search_entry.get().strip()
-        if not q:
-            return
+        if not q: return
 
         if is_url(q):
             self._download_urls([q])
             return
 
+        # Bump generation to invalidate any in-flight thumbnail loads
+        self.search_gen += 1
+        gen = self.search_gen
+
         self.search_btn.configure(state="disabled", text="…")
         self.dl_btn.configure(state="disabled")
         self.cancel_btn.configure(state="disabled")
 
-        for w in self.results_scroll.winfo_children():
-            w.destroy()
+        self._show_hint("🔍  Searching…")
 
-        ctk.CTkLabel(self.results_scroll, text="🔍  Searching…",
-                     font=ctk.CTkFont(size=14), text_color=DIM).pack(pady=60)
+        threading.Thread(target=self._search_worker, args=(q, gen), daemon=True).start()
 
-        threading.Thread(target=self._search_worker, args=(q,), daemon=True).start()
-
-    def _search_worker(self, query):
+    def _search_worker(self, query, gen):
         try:
             self._log(f"🔍 Searching: {query}")
             search_query = f"ytsearch25:{query}"
-            opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "skip_download": True}
+            opts = {"quiet": True, "no_warnings": True, "extract_flat": True,
+                    "skip_download": True}
 
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(search_query, download=False)
 
             if not info:
-                self._log("⚠ No data returned")
-                self.after(0, lambda: self._show_results([]))
+                self.after(0, lambda: self._show_results([], gen))
                 return
 
             entries = info.get("entries") or []
-            self._log(f"   ↳ Raw: {len(entries)}")
-
             tracks = []
             for e in entries:
                 if not e: continue
                 if not is_music(e): continue
-
                 vid = e.get("id") or ""
                 if not vid:
                     url = e.get("url") or e.get("webpage_url") or ""
-                    if "watch?v=" in url:
-                        vid = url.split("watch?v=")[-1].split("&")[0]
-                    elif "youtu.be/" in url:
-                        vid = url.split("youtu.be/")[-1].split("?")[0]
+                    if "watch?v=" in url: vid = url.split("watch?v=")[-1].split("&")[0]
+                    elif "youtu.be/" in url: vid = url.split("youtu.be/")[-1].split("?")[0]
                 if not vid: continue
+
+                thumb = e.get("thumbnail") or f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
+                views = e.get("view_count")
+                views_str = f"{views:,} views" if views else ""
 
                 tracks.append(Track(
                     title=e.get("title") or "Unknown",
                     artist=e.get("channel") or e.get("uploader") or "",
                     duration=fmt_dur(e.get("duration")) if e.get("duration") else "—",
                     url=f"https://www.youtube.com/watch?v={vid}",
+                    thumbnail=thumb,
+                    views=views_str,
                 ))
 
-            self._log(f"   ↳ Results: {len(tracks)}")
-            self.after(0, lambda: self._show_results(tracks))
+            self._log(f"   ↳ {len(tracks)} results")
+            self.after(0, lambda: self._show_results(tracks, gen))
 
         except Exception as ex:
-            self._log(f"❌ Search error: {ex}")
-            self.after(0, lambda: self._show_results([]))
+            self._log(f"❌ Search: {ex}")
+            self.after(0, lambda: self._show_results([], gen))
 
-    def _show_results(self, tracks):
-        self.results = tracks
+    def _show_results(self, tracks, gen):
+        # Always restore search button regardless of outcome
         self.search_btn.configure(state="normal", text="Search")
+
+        # If a newer search started while this one was running, discard
+        if gen != self.search_gen:
+            return
+
+        self.results = tracks
 
         for w in self.results_scroll.winfo_children():
             w.destroy()
@@ -499,43 +505,90 @@ class App(ctk.CTk):
         if not tracks:
             ctk.CTkLabel(self.results_scroll, text="No results found.",
                          font=ctk.CTkFont(size=14), text_color=DIM).pack(pady=60)
+            self.dl_btn.configure(state="disabled")
             return
 
         for i, t in enumerate(tracks):
-            self._result_card(t, i)
+            self._result_card(t, i, gen)
 
         self.dl_btn.configure(state="normal", text=f"⬇  Download All ({len(tracks)})")
 
-    def _result_card(self, t: Track, idx):
+    def _result_card(self, t: Track, idx, gen):
         card = ctk.CTkFrame(self.results_scroll, fg_color=CARD, corner_radius=10,
                             border_width=1, border_color=BORDER)
         card.pack(fill="x", pady=3)
-        card.grid_columnconfigure(2, weight=1)
+        card.grid_columnconfigure(3, weight=1)
 
         var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(card, text="", variable=var, width=28,
                         fg_color=ACCENT, hover_color=ACCENT2,
                         command=lambda v=var, tr=t: self._toggle(tr, v)
-                        ).grid(row=0, column=0, padx=(14, 10), pady=12)
+                        ).grid(row=0, column=0, padx=(14, 8), pady=10)
 
-        ctk.CTkLabel(card, text=f"{idx + 1:02d}", font=ctk.CTkFont(size=12),
-                     text_color=DIM, width=24).grid(row=0, column=1, padx=(0, 6))
+        thumb_lbl = ctk.CTkLabel(card, text="🎵", width=120, height=68,
+                                 fg_color=HOVER, corner_radius=6,
+                                 font=ctk.CTkFont(size=20))
+        thumb_lbl.grid(row=0, column=1, padx=(0, 12), pady=10)
+
+        if t.thumbnail and PIL_OK:
+            threading.Thread(target=self._load_thumb,
+                             args=(t.thumbnail, thumb_lbl, gen, idx),
+                             daemon=True).start()
 
         info = ctk.CTkFrame(card, fg_color="transparent")
-        info.grid(row=0, column=2, sticky="ew", padx=(0, 12), pady=10)
+        info.grid(row=0, column=3, sticky="ew", padx=(0, 12), pady=10)
         ctk.CTkLabel(info, text=t.title, anchor="w",
-                     font=ctk.CTkFont(size=13, weight="bold")).pack(fill="x")
-        ctk.CTkLabel(info, text=f"{t.artist}  ·  {t.duration}", anchor="w",
-                     font=ctk.CTkFont(size=11), text_color=DIM).pack(fill="x", pady=(2, 0))
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(fill="x")
+        meta = t.artist
+        if t.duration != "—": meta += f"  ·  {t.duration}"
+        if t.views: meta += f"  ·  {t.views}"
+        ctk.CTkLabel(info, text=meta, anchor="w",
+                     font=ctk.CTkFont(size=12), text_color=DIM).pack(fill="x", pady=(3, 0))
 
-        ctk.CTkButton(card, text="⬇", width=36, height=32,
+        ctk.CTkButton(card, text="⬇", width=38, height=34,
                       fg_color="transparent", hover_color=ACCENT,
-                      text_color=DIM, font=ctk.CTkFont(size=14),
+                      text_color=DIM, font=ctk.CTkFont(size=15),
                       command=lambda u=t.url: self._download_urls([u])
-                      ).grid(row=0, column=3, padx=(0, 14))
+                      ).grid(row=0, column=4, padx=(0, 14))
 
         card.bind("<Enter>", lambda e, c=card: c.configure(fg_color=HOVER))
         card.bind("<Leave>", lambda e, c=card: c.configure(fg_color=CARD))
+
+    def _load_thumb(self, url, label, gen, idx):
+        try:
+            import hashlib
+            cache_key = hashlib.md5(url.encode()).hexdigest()
+            cache_path = THUMB_CACHE / f"{cache_key}.jpg"
+
+            if cache_path.exists():
+                data = cache_path.read_bytes()
+            else:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = resp.read()
+                cache_path.write_bytes(data)
+
+            if gen != self.search_gen:
+                return
+
+            img = Image.open(io.BytesIO(data))
+            img = img.resize((120, 68), Image.LANCZOS)
+            ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(120, 68))
+
+            def apply():
+                if gen != self.search_gen:
+                    return
+                try:
+                    if label.winfo_exists():
+                        label.configure(image=ctk_img, text="", width=120, height=68)
+                        label._img_ref = ctk_img
+                except Exception:
+                    pass
+
+            self.after(0, apply)
+
+        except Exception:
+            pass
 
     def _toggle(self, track, var):
         track.selected = var.get()
@@ -548,25 +601,20 @@ class App(ctk.CTk):
     # ───────────────── DOWNLOAD ─────────────────────────────────────────────
     def _download_selected(self):
         sel = [t.url for t in self.results if t.selected]
-        if not sel:
-            sel = [t.url for t in self.results]
-        if sel:
-            self._download_urls(sel)
+        if not sel: sel = [t.url for t in self.results]
+        if sel: self._download_urls(sel)
 
     def _download_urls(self, urls):
         if not urls: return
         if not self.ff_ok:
-            messagebox.showerror("Error", "FFmpeg not found. Install it first.")
+            messagebox.showerror("Error", "FFmpeg not found.")
             return
-
         self.downloading = True
         self.dl_btn.configure(state="disabled", text="⏳ Downloading…")
         self.cancel_btn.configure(state="normal")
         self.cancel_evt.clear()
         self._set_status("Downloading…", AMBER)
         self._log(f"🚀 Downloading {len(urls)} item(s)")
-        self._nav("search")
-
         self.worker = threading.Thread(target=self._dl_worker, args=(urls,), daemon=True)
         self.worker.start()
 
@@ -579,22 +627,19 @@ class App(ctk.CTk):
         out = ensure_dir(Path(self.cfg["output_dir"]))
         fmt = self.fmt_menu.get()
         fi = FORMATS.get(fmt, FORMATS["MP3 · 320 kbps"])
-
         success = 0
         failed = 0
 
         for i, url in enumerate(urls, 1):
             if self.cancel_evt.is_set():
-                self._log("🛑 Cancelled")
-                break
+                self._log("🛑 Cancelled"); break
             self._set_status(f"[{i}/{len(urls)}] Downloading…", AMBER)
             try:
                 self._dl_one(url, out, fi)
                 success += 1
                 self._log(f"✅ [{i}/{len(urls)}] Done")
             except yt_dlp.utils.DownloadCancelled:
-                self._log("🛑 Cancelled")
-                break
+                self._log("🛑 Cancelled"); break
             except Exception as e:
                 failed += 1
                 self._log(f"❌ [{i}/{len(urls)}] {str(e)[:120]}")
@@ -606,21 +651,13 @@ class App(ctk.CTk):
         self._log(f"🎉 Complete: {success} succeeded, {failed} failed")
 
     def _dl_one(self, url, out: Path, fi):
-        # Detect if this is a playlist URL
-        is_playlist = ("list=" in url or "/playlist" in url) and "watch?v=" not in url.split("list=")[0] if "list=" in url else "/playlist" in url
-
-        # Simpler check:
-        is_playlist = "list=" in url and "watch?v=" not in url
+        is_playlist = "list=" in url and "watch?v=" not in url.split("list=")[0]
 
         pp = [{"key": "FFmpegExtractAudio",
-               "preferredcodec": fi["codec"],
-               "preferredquality": fi["q"]}]
-
+               "preferredcodec": fi["codec"], "preferredquality": fi["q"]}]
         if self.v_meta.get():
-            pp += [
-                {"key": "FFmpegMetadata", "add_metadata": True},
-                {"key": "EmbedThumbnail"},
-            ]
+            pp += [{"key": "FFmpegMetadata", "add_metadata": True},
+                   {"key": "EmbedThumbnail"}]
 
         ppa = {}
         if fi["codec"] == "mp3":
@@ -631,16 +668,15 @@ class App(ctk.CTk):
                 ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"])
 
         def hook(d):
-            if self.cancel_evt.is_set():
-                raise yt_dlp.utils.DownloadCancelled
+            if self.cancel_evt.is_set(): raise yt_dlp.utils.DownloadCancelled
             if d.get("status") == "downloading":
                 pct = d.get("_percent_str", "").strip()
                 spd = d.get("_speed_str", "").strip()
                 self._set_status(f"⬇ {pct}  {spd}", AMBER)
 
-        # ── KEY FIX: playlist gets its own subfolder ──
         if is_playlist:
-            outtmpl = str(out / "%(playlist_title,Playlist)s" / "%(playlist_index)02d - %(title)s.%(ext)s")
+            outtmpl = str(out / "%(playlist_title,Playlist)s" /
+                          "%(playlist_index)02d - %(title)s.%(ext)s")
             noplaylist = False
         else:
             outtmpl = str(out / "%(title)s.%(ext)s")
@@ -680,23 +716,17 @@ class App(ctk.CTk):
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
-        # Post-process
         if info and (self.v_meta.get() or self.v_lyr.get()):
-            entries = info.get("entries") or [info]
-            for ent in entries:
-                if not ent:
-                    continue
+            for ent in (info.get("entries") or [info]):
+                if not ent: continue
                 try:
                     fn = ydl.prepare_filename(ent)
                     fp = Path(fn).with_suffix(f".{fi['ext']}")
                     if fp.exists():
-                        if self.v_meta.get():
-                            fix_cover(fp, self._log)
+                        if self.v_meta.get(): fix_cover(fp, self._log)
                         if self.v_lyr.get():
-                            embed_lyrics(fp, ent.get("title", ""),
-                                         self.v_lrc.get(), self._log)
-                except Exception:
-                    pass
+                            embed_lyrics(fp, ent.get("title", ""), self.v_lrc.get(), self._log)
+                except Exception: pass
 
     # ───────────────── HELPERS ──────────────────────────────────────────────
     def _browse(self):
@@ -714,8 +744,7 @@ class App(ctk.CTk):
         self.log_text.configure(state="normal")
         c = self.log_text.get("1.0", "end")
         self.log_text.configure(state="disabled")
-        self.clipboard_clear()
-        self.clipboard_append(c)
+        self.clipboard_clear(); self.clipboard_append(c)
 
     def _clear_log(self):
         self.log_text.configure(state="normal")
@@ -738,10 +767,8 @@ class App(ctk.CTk):
 
     def _quit(self):
         self.cancel_evt.set()
-        if self.worker and self.worker.is_alive():
-            self.worker.join(timeout=3)
-        self.cfg["geometry"] = self.geometry()
-        save_cfg(self.cfg)
+        if self.worker and self.worker.is_alive(): self.worker.join(timeout=3)
+        self.cfg["geometry"] = self.geometry(); save_cfg(self.cfg)
         self.destroy()
 
 
@@ -750,6 +777,6 @@ if __name__ == "__main__":
     print("=" * 52)
     print(f"  {APP} v{VER}")
     print(f"  FFmpeg: {ff if ff_ok(ff) else 'NOT FOUND'}")
-    print(f"  lyrics: {LYRICS_OK}  mutagen: {MUTAGEN_OK}")
+    print(f"  Pillow: {PIL_OK}  lyrics: {LYRICS_OK}  mutagen: {MUTAGEN_OK}")
     print("=" * 52)
     App().mainloop()
