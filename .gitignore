@@ -1,28 +1,29 @@
-# Virtual Environments
+# ── Virtual Environments ──
 venv/
 env/
 ENV/
 .venv/
 
-# Python cache
+# ── Python cache ──
 __pycache__/
 *.pyc
+*.pyo
 
-# Downloaded music & temporary cover art thumbnails
+# ── Downloaded music ──
 *.mp3
 *.flac
 *.m4a
+*.opus
 *.webm
 *.wav
-*.jpg
-*.jpeg
-*.webp
-*.png
+*.ogg
 
-# Application logs & yt-dlp archives
+# ── Lyrics sidecar files ──
+*.lrc
+
+# ── yt-dlp download archive ──
+.sg_archive.txt
 download_archive.txt
-*.log
 
-# Operating System garbage
-Thumbs.db
-.DS_Store
+# ── Thumbnail cache (app-generated, not screenshots) ──
+.son
