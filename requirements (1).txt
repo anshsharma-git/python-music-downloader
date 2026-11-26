@@ -1,0 +1,8 @@
+# SonicGrabber Pro — Python dependencies (tested with Python 3.12)
+customtkinter>=6.0
+yt-dlp[default]            # always use the newest yt-dlp: YouTube changes often
+pillow>=10.0
+mutagen>=1.47
+syncedlyrics>=1.0
+# Linux only — lets yt-dlp read cookies from Chrome / Chromium / Brave (not needed for Firefox)
+secretstorage; sys_platform == "linux"

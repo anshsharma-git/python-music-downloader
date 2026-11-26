@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build output (the Linux build is published under Releases, not committed)
+.buildenv/
+build/
+dist/
+*.spec
+SonicGrabber
+*.tar.gz
+
+# Local files
+*.log
+queue.json
+history.db
+.DS_Store
